@@ -13,6 +13,10 @@ from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler
+import os
+import pickle
+import json
+from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -37,13 +41,143 @@ class TriTimeframeAnalyzer:
         self.biweekly_price_scaler = StandardScaler()
         
     def fetch_data(self):
-        """Fetch stock data from Yahoo Finance"""
+        """Fetch stock data from Yahoo Finance with intelligent caching"""
+        
+        # Cache setup
+        cache_dir = 'cache'
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, f"{self.symbol}_{self.period}_data.pkl")
+        metadata_file = os.path.join(cache_dir, f"{self.symbol}_{self.period}_metadata.json")
+        
+        # Check if cache exists and is recent
+        if os.path.exists(cache_file) and os.path.exists(metadata_file):
+            try:
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+                
+                cache_date = datetime.fromisoformat(metadata['last_update']).date()
+                today = datetime.now().date()
+                
+                # For weekends, use cached data
+                if today.weekday() >= 5:
+                    print(f"📁 Weekend: Loading cached data for {self.symbol} (last updated: {cache_date})")
+                    with open(cache_file, 'rb') as f:
+                        self.data = pickle.load(f)
+                    print(f"✅ Loaded {len(self.data)} days from cache")
+                    return True
+                
+                # For weekdays, always fetch today's live data
+                print(f"📈 Fetching live data to update cache (last cache: {cache_date})")
+                with open(cache_file, 'rb') as f:
+                    cached_data = pickle.load(f)
+                
+                last_date = datetime.fromisoformat(metadata['last_date']).date()
+                
+                # Always fetch today's data + small overlap for current prices
+                ticker = yf.Ticker(self.symbol)
+                start_date = last_date - timedelta(days=2)  # Small overlap
+                recent_data = ticker.history(start=start_date)
+                
+                # Get current day's latest data for live pricing
+                try:
+                    current_data = ticker.history(period='1d')
+                    if not current_data.empty:
+                        latest_price = current_data['Close'].iloc[-1]
+                        print(f"🔴 Live price: ${latest_price:.2f}")
+                        
+                        # Replace today's entire row with current data
+                        today_date = datetime.now().date()
+                        today_mask = recent_data.index.date == today_date
+                        
+                        if today_mask.any():
+                            # Update the existing row with current data
+                            today_index = recent_data.index[today_mask][0]
+                            recent_data.loc[today_index] = current_data.iloc[-1]
+                            print(f"✅ Updated today's data with live values")
+                        else:
+                            # Add today's data if not present
+                            recent_data = pd.concat([recent_data, current_data])
+                            print(f"✅ Added today's live data")
+                            
+                except Exception as e:
+                    print(f"⚠️  Could not fetch live price: {e}")
+                
+                if not recent_data.empty:
+                    # Include overlap to ensure today's updated data is used
+                    overlap_date = cached_data.index[-1].date()
+                    new_data = recent_data[recent_data.index.date >= overlap_date]  # Include today's data
+                    
+                    if not new_data.empty:
+                        # Remove the old overlapping data from cache, add new data
+                        cached_data_filtered = cached_data[cached_data.index.date < overlap_date]
+                        self.data = pd.concat([cached_data_filtered, new_data])
+                        self.data = self.data.sort_index()
+                        print(f"✅ Updated cache with {len(new_data)} days (including today's live data)")
+                    else:
+                        self.data = cached_data
+                        print(f"📁 No new data, using cached data")
+                else:
+                    self.data = cached_data
+                    print(f"📁 No recent data available, using cached data")
+                
+            except Exception as e:
+                print(f"⚠️  Cache error: {e}, fetching fresh data...")
+                return self.fetch_fresh_data(cache_file, metadata_file)
+        else:
+            print(f"🌐 No cache found, fetching {self.period} of data...")
+            return self.fetch_fresh_data(cache_file, metadata_file)
+        
+        # Save updated cache
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(self.data, f)
+            
+            metadata = {
+                'symbol': self.symbol,
+                'period': self.period,
+                'last_update': datetime.now().isoformat(),
+                'last_date': self.data.index[-1].isoformat(),
+                'total_days': len(self.data)
+            }
+            
+            with open(metadata_file, 'w') as f:
+                json.dump(metadata, f)
+                
+            print(f"💾 Cache updated: {len(self.data)} total days")
+            
+        except Exception as e:
+            print(f"⚠️  Failed to save cache: {e}")
+        
+        return True
+    
+    def fetch_fresh_data(self, cache_file, metadata_file):
+        """Fetch fresh data and save to cache"""
         try:
             ticker = yf.Ticker(self.symbol)
             self.data = ticker.history(period=self.period)
             if self.data.empty:
                 raise ValueError(f"No data found for symbol {self.symbol}")
+            
+            print(f"✅ Downloaded {len(self.data)} days of data")
+            
+            # Save to cache
+            with open(cache_file, 'wb') as f:
+                pickle.dump(self.data, f)
+            
+            metadata = {
+                'symbol': self.symbol,
+                'period': self.period,
+                'last_update': datetime.now().isoformat(),
+                'last_date': self.data.index[-1].isoformat(),
+                'total_days': len(self.data)
+            }
+            
+            with open(metadata_file, 'w') as f:
+                json.dump(metadata, f)
+                
+            print(f"💾 Data cached for future use")
             return True
+            
         except Exception as e:
             print(f"Error fetching data: {e}")
             return False
