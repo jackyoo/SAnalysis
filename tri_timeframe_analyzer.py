@@ -63,6 +63,12 @@ class TriTimeframeAnalyzer:
                     print(f"📁 Weekend: Loading cached data for {self.symbol} (last updated: {cache_date})")
                     with open(cache_file, 'rb') as f:
                         self.data = pickle.load(f)
+                    
+                    # Verify loaded data is valid
+                    if self.data is None or self.data.empty:
+                        print(f"⚠️  Cached data is invalid, fetching fresh data...")
+                        return self.fetch_fresh_data(cache_file, metadata_file)
+                    
                     print(f"✅ Loaded {len(self.data)} days from cache")
                     return True
                 
@@ -71,57 +77,96 @@ class TriTimeframeAnalyzer:
                 with open(cache_file, 'rb') as f:
                     cached_data = pickle.load(f)
                 
+                # Verify cached data is valid
+                if cached_data is None or cached_data.empty:
+                    print(f"⚠️  Cached data is invalid, fetching fresh data...")
+                    return self.fetch_fresh_data(cache_file, metadata_file)
+                
                 last_date = datetime.fromisoformat(metadata['last_date']).date()
                 
                 # Always fetch today's data + small overlap for current prices
                 ticker = yf.Ticker(self.symbol)
                 start_date = last_date - timedelta(days=2)  # Small overlap
-                recent_data = ticker.history(start=start_date)
+                
+                # Fetch recent data with retry logic
+                recent_data = None
+                for attempt in range(3):  # Try up to 3 times
+                    try:
+                        print(f"📡 Attempting to fetch recent data (attempt {attempt + 1}/3)...")
+                        recent_data = ticker.history(start=start_date)
+                        if recent_data is not None and not recent_data.empty:
+                            print(f"✅ Successfully fetched recent data")
+                            break
+                        else:
+                            print(f"⚠️  Got empty data on attempt {attempt + 1}")
+                    except Exception as fetch_error:
+                        print(f"⚠️  Fetch attempt {attempt + 1} failed: {fetch_error}")
+                        if attempt < 2:  # Don't sleep on last attempt
+                            import time
+                            time.sleep(2)  # Wait 2 seconds before retry
+                
+                # Check if recent_data is valid
+                if recent_data is None or recent_data.empty:
+                    print(f"⚠️  Could not fetch recent data, using cached data only")
+                    self.data = cached_data
+                    return True
                 
                 # Get current day's latest data for live pricing
                 try:
                     current_data = ticker.history(period='1d')
-                    if not current_data.empty:
+                    if current_data is not None and not current_data.empty:
                         latest_price = current_data['Close'].iloc[-1]
                         print(f"🔴 Live price: ${latest_price:.2f}")
                         
                         # Replace today's entire row with current data
                         today_date = datetime.now().date()
-                        today_mask = recent_data.index.date == today_date
-                        
-                        if today_mask.any():
-                            # Update the existing row with current data
-                            today_index = recent_data.index[today_mask][0]
-                            recent_data.loc[today_index] = current_data.iloc[-1]
-                            print(f"✅ Updated today's data with live values")
+                        if not recent_data.empty:
+                            today_mask = recent_data.index.date == today_date
+                            
+                            if today_mask.any():
+                                # Update the existing row with current data
+                                today_index = recent_data.index[today_mask][0]
+                                recent_data.loc[today_index] = current_data.iloc[-1]
+                                print(f"✅ Updated today's data with live values")
+                            else:
+                                # Add today's data if not present
+                                recent_data = pd.concat([recent_data, current_data])
+                                print(f"✅ Added today's live data")
                         else:
-                            # Add today's data if not present
-                            recent_data = pd.concat([recent_data, current_data])
+                            # If recent_data is empty, use current_data
+                            recent_data = current_data.copy()
                             print(f"✅ Added today's live data")
                             
                 except Exception as e:
                     print(f"⚠️  Could not fetch live price: {e}")
                 
-                if not recent_data.empty:
+                if recent_data is not None and not recent_data.empty:
                     # Include overlap to ensure today's updated data is used
-                    overlap_date = cached_data.index[-1].date()
-                    new_data = recent_data[recent_data.index.date >= overlap_date]  # Include today's data
-                    
-                    if not new_data.empty:
-                        # Remove the old overlapping data from cache, add new data
-                        cached_data_filtered = cached_data[cached_data.index.date < overlap_date]
-                        self.data = pd.concat([cached_data_filtered, new_data])
-                        self.data = self.data.sort_index()
-                        print(f"✅ Updated cache with {len(new_data)} days (including today's live data)")
+                    if not cached_data.empty:
+                        overlap_date = cached_data.index[-1].date()
+                        new_data = recent_data[recent_data.index.date >= overlap_date]  # Include today's data
+                        
+                        if not new_data.empty:
+                            # Remove the old overlapping data from cache, add new data
+                            cached_data_filtered = cached_data[cached_data.index.date < overlap_date]
+                            self.data = pd.concat([cached_data_filtered, new_data])
+                            self.data = self.data.sort_index()
+                            print(f"✅ Updated cache with {len(new_data)} days (including today's live data)")
+                        else:
+                            self.data = cached_data
+                            print(f"📁 No new data, using cached data")
                     else:
-                        self.data = cached_data
-                        print(f"📁 No new data, using cached data")
+                        self.data = recent_data
+                        print(f"✅ Using recent data as cache was empty")
                 else:
                     self.data = cached_data
                     print(f"📁 No recent data available, using cached data")
                 
             except Exception as e:
-                print(f"⚠️  Cache error: {e}, fetching fresh data...")
+                import traceback
+                print(f"⚠️  Cache error: {e}")
+                print(f"⚠️  Stack trace: {traceback.format_exc()}")
+                print("⚠️  Fetching fresh data...")
                 return self.fetch_fresh_data(cache_file, metadata_file)
         else:
             print(f"🌐 No cache found, fetching {self.period} of data...")
@@ -129,21 +174,22 @@ class TriTimeframeAnalyzer:
         
         # Save updated cache
         try:
-            with open(cache_file, 'wb') as f:
-                pickle.dump(self.data, f)
-            
-            metadata = {
-                'symbol': self.symbol,
-                'period': self.period,
-                'last_update': datetime.now().isoformat(),
-                'last_date': self.data.index[-1].isoformat(),
-                'total_days': len(self.data)
-            }
-            
-            with open(metadata_file, 'w') as f:
-                json.dump(metadata, f)
+            if self.data is not None and not self.data.empty:
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(self.data, f)
                 
-            print(f"💾 Cache updated: {len(self.data)} total days")
+                metadata = {
+                    'symbol': self.symbol,
+                    'period': self.period,
+                    'last_update': datetime.now().isoformat(),
+                    'last_date': self.data.index[-1].isoformat(),
+                    'total_days': len(self.data)
+                }
+                
+                with open(metadata_file, 'w') as f:
+                    json.dump(metadata, f)
+                    
+                print(f"💾 Cache updated: {len(self.data)} total days")
             
         except Exception as e:
             print(f"⚠️  Failed to save cache: {e}")
@@ -154,21 +200,51 @@ class TriTimeframeAnalyzer:
         """Fetch fresh data and save to cache"""
         try:
             ticker = yf.Ticker(self.symbol)
-            self.data = ticker.history(period=self.period)
-            if self.data.empty:
-                raise ValueError(f"No data found for symbol {self.symbol}")
             
-            print(f"✅ Downloaded {len(self.data)} days of data")
+            # Fetch data with retry logic
+            self.data = None
+            for attempt in range(3):  # Try up to 3 times
+                try:
+                    print(f"📡 Fetching {self.period} data (attempt {attempt + 1}/3)...")
+                    self.data = ticker.history(period=self.period)
+                    
+                    if self.data is not None and not self.data.empty and len(self.data.index) > 0:
+                        print(f"✅ Downloaded {len(self.data)} days of data")
+                        break
+                    else:
+                        print(f"⚠️  Got invalid data on attempt {attempt + 1}")
+                        
+                except Exception as fetch_error:
+                    print(f"⚠️  Fetch attempt {attempt + 1} failed: {fetch_error}")
+                    if attempt < 2:  # Don't sleep on last attempt
+                        import time
+                        time.sleep(2)  # Wait 2 seconds before retry
+            
+            # Final validation
+            if self.data is None:
+                raise ValueError(f"Failed to fetch data for symbol {self.symbol} - got None after all retries")
+            
+            if self.data.empty:
+                raise ValueError(f"No data found for symbol {self.symbol} - empty dataset after all retries")
+            
+            if len(self.data.index) == 0:
+                raise ValueError(f"No index data found for symbol {self.symbol} after all retries")
             
             # Save to cache
             with open(cache_file, 'wb') as f:
                 pickle.dump(self.data, f)
             
+            # Create metadata safely
+            try:
+                last_date_iso = self.data.index[-1].isoformat()
+            except (IndexError, AttributeError) as e:
+                raise ValueError(f"Cannot access last date from data index: {e}")
+            
             metadata = {
                 'symbol': self.symbol,
                 'period': self.period,
                 'last_update': datetime.now().isoformat(),
-                'last_date': self.data.index[-1].isoformat(),
+                'last_date': last_date_iso,
                 'total_days': len(self.data)
             }
             
